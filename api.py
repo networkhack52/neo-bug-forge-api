@@ -47,7 +47,7 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 API_SECRET_KEY    = os.environ.get("API_SECRET_KEY", "dev-secret-change-in-prod")
 ENVIRONMENT       = os.environ.get("ENVIRONMENT", "development")
-MODEL             = "claude-3-5-sonnet-20240620"
+MODEL             = "claude-haiku-4-5-20251001"
 MAX_TOKENS        = 2048
 
 # ─── In-memory fix store (swap for Redis/Postgres in production) ──────────────
