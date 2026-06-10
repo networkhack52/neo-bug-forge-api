@@ -119,7 +119,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 origins = ["*"] if ENVIRONMENT == "development" else [
-    "https://neobugforge.io",
+    "https://neo-bug-forge-web.vercel.app",
     "https://www.neobugforge.io",
     "https://app.neobugforge.io",
 ]
