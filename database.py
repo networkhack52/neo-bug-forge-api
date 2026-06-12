@@ -32,7 +32,8 @@ def lookup_api_key(api_key: str) -> dict | None:
             .execute()
         )
         return result.data
-    except Exception:
+    except Exception as e:
+        print(f"[DB ERROR] lookup_api_key failed: {e}")
         return None
 
 
