@@ -50,8 +50,7 @@ ENVIRONMENT       = os.environ.get("ENVIRONMENT", "development")
 MODEL             = "claude-haiku-4-5-20251001"
 MAX_TOKENS        = 2048
 
-# ─── In-memory fix store (swap for Redis/Postgres in production) ──────────────
-FIX_STORE: dict[str, dict] = {}
+from database import lookup_api_key, check_and_increment_quota, save_fix, get_fix_by_id
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
@@ -96,10 +95,10 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not ANTHROPIC_API_KEY:
-        print("⚠  WARNING: ANTHROPIC_API_KEY not set")
+        print("[!] WARNING: ANTHROPIC_API_KEY not set")
     else:
-        print(f"✓  Anthropic configured ({ANTHROPIC_API_KEY[:12]}...)")
-    print(f"✓  Neo Bug Forge API [{ENVIRONMENT}] ready")
+        print(f"[+] Anthropic configured ({ANTHROPIC_API_KEY[:12]}...)")
+    print(f"[+] Neo Bug Forge API [{ENVIRONMENT}] ready")
     yield
     print("Neo Bug Forge API shutting down.")
 
@@ -132,10 +131,13 @@ app.add_middleware(
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
-def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
+def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> dict:
     if not x_api_key.startswith("nbf_") or len(x_api_key) < 20:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-    return x_api_key
+        raise HTTPException(status_code=401, detail="Invalid API key format.")
+    key_row = lookup_api_key(x_api_key)
+    if not key_row:
+        raise HTTPException(status_code=401, detail="API key not found or inactive.")
+    return key_row
 
 # ─── Prompt ───────────────────────────────────────────────────────────────────
 
@@ -172,10 +174,11 @@ Respond with raw JSON only."""
 
 
 def run_fix(code: str, error: str, language: str) -> dict:
-    if not ANTHROPIC_API_KEY:
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
         raise ValueError("ANTHROPIC_API_KEY is not configured on the server.")
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=api_key)
 
     try:
         message = client.messages.create(
@@ -208,6 +211,73 @@ def run_fix(code: str, error: str, language: str) -> dict:
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
+class UsageResponse(BaseModel):
+    tier:         str
+    fixes_used:   int
+    fixes_limit:  int
+    remaining:    int
+    tokens_used:  int
+    is_unlimited: bool
+
+
+class CreateKeyRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=200)
+
+class CreateKeyResponse(BaseModel):
+    api_key:     str
+    email:       str
+    tier:        str
+    fixes_limit: int
+    message:     str
+
+
+@app.post("/v1/keys", response_model=CreateKeyResponse, tags=["Keys"],
+          summary="Generate a new API key")
+@limiter.limit("5/hour")
+async def create_key(request: Request, body: CreateKeyRequest):
+    import secrets
+    from database import get_db, hash_key
+
+    raw_key = "nbf_" + secrets.token_urlsafe(32)
+    db = get_db()
+
+    # Check if email already has a key
+    existing = db.table("api_keys").select("id").eq("user_email", body.email).execute()
+    if existing.data:
+        raise HTTPException(status_code=409, detail="An API key already exists for this email.")
+
+    db.table("api_keys").insert({
+        "key_hash":    hash_key(raw_key),
+        "user_email":  body.email,
+        "tier":        "free",
+        "fixes_limit": 100,
+    }).execute()
+
+    return CreateKeyResponse(
+        api_key     = raw_key,
+        email       = body.email,
+        tier        = "free",
+        fixes_limit = 100,
+        message     = "Save this key — it won't be shown again.",
+    )
+
+
+@app.get("/v1/usage", response_model=UsageResponse, tags=["Usage"],
+         summary="Get current quota and usage for your API key")
+async def get_usage(key_row: dict = Depends(verify_api_key)):
+    is_unlimited = key_row["tier"] == "team"
+    fixes_limit  = key_row["fixes_limit"]
+    fixes_used   = key_row["fixes_used"]
+    return UsageResponse(
+        tier         = key_row["tier"],
+        fixes_used   = fixes_used,
+        fixes_limit  = fixes_limit,
+        remaining    = 999999 if is_unlimited else max(0, fixes_limit - fixes_used),
+        tokens_used  = key_row["tokens_used"],
+        is_unlimited = is_unlimited,
+    )
+
+
 @app.get("/", tags=["Meta"])
 def root():
     return {
@@ -235,11 +305,11 @@ def health():
 
 
 @app.post("/v1/fix", response_model=FixResponse, tags=["Fix"],
-          summary="Fix a bug (authenticated — unlimited)")
+          summary="Fix a bug (authenticated — quota-based)")
 @limiter.limit("120/minute")
 async def fix_authenticated(request: Request, body: FixRequest,
-                             api_key: str = Depends(verify_api_key)):
-    return await _process_fix(body)
+                             key_row: dict = Depends(verify_api_key)):
+    return await _process_fix(body, key_row=key_row)
 
 
 @app.post("/v1/fix/public", response_model=FixResponse, tags=["Fix"],
@@ -252,25 +322,46 @@ async def fix_public(request: Request, body: FixRequest):
 @app.get("/v1/fix/{fix_id}", response_model=FixResponse, tags=["Fix"],
          summary="Retrieve a previous fix by ID")
 async def get_fix(fix_id: str):
-    fix = FIX_STORE.get(fix_id)
+    fix = get_fix_by_id(fix_id)
     if not fix:
         raise HTTPException(status_code=404, detail=f"Fix '{fix_id}' not found.")
     return fix
 
 # ─── Shared processing ────────────────────────────────────────────────────────
 
-async def _process_fix(body: FixRequest) -> FixResponse:
+async def _process_fix(body: FixRequest, key_row: dict | None = None) -> FixResponse:
     fix_id = str(uuid.uuid4())[:8]
     start  = time.time()
+
+    # Quota check for authenticated users
+    if key_row:
+        allowed, remaining = check_and_increment_quota(
+            key_row["id"], key_row["tier"], key_row["fixes_limit"]
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Quota exhausted ({key_row['fixes_limit']} fixes). Upgrade your plan."
+            )
 
     try:
         result = await asyncio.to_thread(
             run_fix, body.broken_code, body.error_message, body.language
         )
     except ValueError as e:
+        # Rollback quota on AI failure
+        if key_row:
+            from database import get_db
+            db = get_db()
+            row = db.table("api_keys").select("fixes_used").eq("id", key_row["id"]).single().execute().data
+            if row:
+                db.table("api_keys").update({"fixes_used": max(0, row["fixes_used"] - 1)}).eq("id", key_row["id"]).execute()
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+    # Estimate tokens (4 chars ≈ 1 token)
+    tokens_used = (len(body.broken_code) + len(result.get("fixed_code", ""))) // 4
 
     response = FixResponse(
         fix_id      = fix_id,
@@ -285,9 +376,14 @@ async def _process_fix(body: FixRequest) -> FixResponse:
         share_url   = f"https://neobugforge.io/fix/{fix_id}",
     )
 
-    FIX_STORE[fix_id] = response.model_dump()
+    # Persist to Supabase (non-blocking)
+    asyncio.create_task(asyncio.to_thread(
+        save_fix, fix_id, key_row["id"] if key_row else None,
+        body.dict(), result, tokens_used
+    ))
+
     elapsed = round(time.time() - start, 3)
-    print(f"[fix/{fix_id}] lang={body.language or 'auto'} confidence={result['confidence']} elapsed={elapsed}s")
+    print(f"[fix/{fix_id}] lang={body.language or 'auto'} confidence={result['confidence']} tokens={tokens_used} elapsed={elapsed}s")
 
     return response
 

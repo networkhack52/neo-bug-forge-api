@@ -1,6 +1,7 @@
 ﻿fastapi
-uvicorn
+uvicorn[standard]
 anthropic
 slowapi
 python-dotenv
 pydantic
+supabase
