@@ -31,6 +31,7 @@ from typing import Optional, Literal
 from contextlib import asynccontextmanager
 
 import httpx
+import stripe
 import anthropic
 from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +51,10 @@ API_SECRET_KEY    = os.environ.get("API_SECRET_KEY", "dev-secret-change-in-prod"
 ENVIRONMENT       = os.environ.get("ENVIRONMENT", "development")
 SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY      = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_PRO  = os.environ.get("STRIPE_PRICE_PRO", "")   # price_xxx for Pro $12/mo
+STRIPE_PRICE_TEAM = os.environ.get("STRIPE_PRICE_TEAM", "")  # price_xxx for Team $49/mo
 MODEL             = "claude-haiku-4-5-20251001"
 MAX_TOKENS        = 2048
 
@@ -443,6 +448,60 @@ async def _process_fix(body: FixRequest, key_row: dict | None = None) -> FixResp
     print(f"[fix/{fix_id}] lang={body.language or 'auto'} confidence={result['confidence']} tokens={tokens_used} elapsed={elapsed}s")
 
     return response
+
+# ─── Stripe ───────────────────────────────────────────────────────────────────
+
+class CheckoutRequest(BaseModel):
+    plan: Literal["pro", "team"]
+
+@app.post("/v1/stripe/checkout", tags=["Billing"],
+          summary="Create a Stripe Checkout Session")
+@limiter.limit("10/hour")
+async def create_checkout(request: Request, body: CheckoutRequest,
+                          authorization: Optional[str] = Header(None)):
+    user = await verify_supabase_token(authorization or "")
+    stripe.api_key = STRIPE_SECRET_KEY
+    price_id = STRIPE_PRICE_PRO if body.plan == "pro" else STRIPE_PRICE_TEAM
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Stripe price not configured.")
+    app_url = "https://app.neobugforge.io"
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        customer_email=user["email"],
+        metadata={"supabase_user_id": user["id"], "user_email": user["email"], "plan": body.plan},
+        success_url=f"{app_url}/dashboard?upgraded=1",
+        cancel_url=f"{app_url}/dashboard?cancelled=1",
+    )
+    return {"url": session.url}
+
+
+@app.post("/v1/stripe/webhook", tags=["Billing"],
+          summary="Stripe webhook — upgrades user tier on successful payment")
+async def stripe_webhook(request: Request):
+    payload  = await request.body()
+    sig      = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    if event["type"] == "checkout.session.completed":
+        session  = event["data"]["object"]
+        email    = session.get("customer_email") or session["metadata"].get("user_email")
+        plan     = session["metadata"].get("plan", "pro")
+        tier     = plan  # 'pro' or 'team'
+        fixes_limit = 500 if tier == "pro" else 999999
+        if email:
+            from database import get_db
+            db = get_db()
+            db.table("api_keys").update({
+                "tier": tier,
+                "fixes_limit": fixes_limit,
+            }).eq("user_email", email).execute()
+
+    return {"received": True}
+
 
 # ─── Global error handler ─────────────────────────────────────────────────────
 
