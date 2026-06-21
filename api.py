@@ -488,7 +488,6 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
 
     if event["type"] == "checkout.session.completed":
-        # Stripe Workbench sends thin events — fetch full event to get data object
         obj = event.get("data", {}).get("object", {})
         if not obj.get("customer_email") and not obj.get("metadata"):
             full_event = stripe.Event.retrieve(event["id"])
@@ -496,7 +495,7 @@ async def stripe_webhook(request: Request):
 
         email = obj.get("customer_email") or obj.get("metadata", {}).get("user_email")
         plan  = obj.get("metadata", {}).get("plan", "pro")
-        tier  = plan  # 'pro' or 'team'
+        tier  = plan
         fixes_limit = 500 if tier == "pro" else 999999
         if email:
             from database import get_db
@@ -508,6 +507,43 @@ async def stripe_webhook(request: Request):
             print(f"[webhook] Upgraded {email} to {tier}")
 
     return {"received": True}
+
+
+@app.post("/v1/stripe/verify", tags=["Billing"],
+          summary="Verify Stripe subscription and upgrade user tier")
+@limiter.limit("20/hour")
+async def verify_subscription(request: Request, authorization: Optional[str] = Header(None)):
+    """Called from the dashboard after successful checkout to sync the subscription."""
+    user = await verify_supabase_token(authorization or "")
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    customers = stripe.Customer.list(email=user["email"], limit=1)
+    if not customers.data:
+        return {"upgraded": False, "tier": "free"}
+
+    subscriptions = stripe.Subscription.list(
+        customer=customers.data[0].id, status="active", limit=1
+    )
+    if not subscriptions.data:
+        return {"upgraded": False, "tier": "free"}
+
+    price_id = subscriptions.data[0]["items"]["data"][0]["price"]["id"]
+    if price_id == STRIPE_PRICE_PRO:
+        tier, fixes_limit = "pro", 500
+    elif price_id == STRIPE_PRICE_TEAM:
+        tier, fixes_limit = "team", 999999
+    else:
+        return {"upgraded": False, "tier": "free"}
+
+    from database import get_db
+    db = get_db()
+    db.table("api_keys").update({
+        "tier": tier,
+        "fixes_limit": fixes_limit,
+    }).eq("user_email", user["email"]).execute()
+    print(f"[verify] Upgraded {user['email']} to {tier}")
+
+    return {"upgraded": True, "tier": tier}
 
 
 # ─── Global error handler ─────────────────────────────────────────────────────
