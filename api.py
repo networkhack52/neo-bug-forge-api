@@ -481,16 +481,22 @@ async def create_checkout(request: Request, body: CheckoutRequest,
 async def stripe_webhook(request: Request):
     payload  = await request.body()
     sig      = request.headers.get("stripe-signature", "")
+    stripe.api_key = STRIPE_SECRET_KEY
     try:
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
 
     if event["type"] == "checkout.session.completed":
-        session  = event["data"]["object"]
-        email    = session.get("customer_email") or session["metadata"].get("user_email")
-        plan     = session["metadata"].get("plan", "pro")
-        tier     = plan  # 'pro' or 'team'
+        # Stripe Workbench sends thin events — fetch full event to get data object
+        obj = event.get("data", {}).get("object", {})
+        if not obj.get("customer_email") and not obj.get("metadata"):
+            full_event = stripe.Event.retrieve(event["id"])
+            obj = full_event["data"]["object"]
+
+        email = obj.get("customer_email") or obj.get("metadata", {}).get("user_email")
+        plan  = obj.get("metadata", {}).get("plan", "pro")
+        tier  = plan  # 'pro' or 'team'
         fixes_limit = 500 if tier == "pro" else 999999
         if email:
             from database import get_db
@@ -499,6 +505,7 @@ async def stripe_webhook(request: Request):
                 "tier": tier,
                 "fixes_limit": fixes_limit,
             }).eq("user_email", email).execute()
+            print(f"[webhook] Upgraded {email} to {tier}")
 
     return {"received": True}
 
