@@ -55,6 +55,7 @@ STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_PRO  = os.environ.get("STRIPE_PRICE_PRO", "")   # price_xxx for Pro $12/mo
 STRIPE_PRICE_TEAM = os.environ.get("STRIPE_PRICE_TEAM", "")  # price_xxx for Team $49/mo
+ADMIN_EMAIL       = os.environ.get("ADMIN_EMAIL", "ya7308312@gmail.com")
 MODEL             = "claude-haiku-4-5-20251001"
 MAX_TOKENS        = 2048
 
@@ -544,6 +545,53 @@ async def verify_subscription(request: Request, authorization: Optional[str] = H
     print(f"[verify] Upgraded {user['email']} to {tier}")
 
     return {"upgraded": True, "tier": tier}
+
+
+# ─── Admin endpoints ──────────────────────────────────────────────────────────
+
+class AdminUpgradeRequest(BaseModel):
+    email: str
+    tier:  Literal["free", "pro", "team"]
+
+@app.post("/v1/admin/upgrade", tags=["Admin"])
+async def admin_upgrade(body: AdminUpgradeRequest,
+                        authorization: Optional[str] = Header(None)):
+    """Manually upgrade or downgrade any user's tier. Admin only."""
+    caller = await verify_supabase_token(authorization or "")
+    if caller["email"] != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Admin only.")
+
+    tier_limits = {"free": 100, "pro": 500, "team": 999999}
+    fixes_limit = tier_limits[body.tier]
+
+    from database import get_db
+    db  = get_db()
+    res = db.table("api_keys").update({
+        "tier": body.tier,
+        "fixes_limit": fixes_limit,
+    }).eq("user_email", body.email).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail=f"No user found with email {body.email}")
+
+    print(f"[admin] {caller['email']} upgraded {body.email} → {body.tier}")
+    return {"ok": True, "email": body.email, "tier": body.tier, "fixes_limit": fixes_limit}
+
+
+@app.get("/v1/admin/users", tags=["Admin"])
+async def admin_list_users(authorization: Optional[str] = Header(None)):
+    """List all users with their tier and usage. Admin only."""
+    caller = await verify_supabase_token(authorization or "")
+    if caller["email"] != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Admin only.")
+
+    from database import get_db
+    db  = get_db()
+    res = db.table("api_keys").select(
+        "user_email, tier, fixes_used, fixes_limit, created_at"
+    ).order("created_at", desc=True).execute()
+
+    return {"users": res.data, "total": len(res.data)}
 
 
 # ─── Global error handler ─────────────────────────────────────────────────────
